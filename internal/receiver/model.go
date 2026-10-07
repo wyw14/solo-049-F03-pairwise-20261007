@@ -8,6 +8,7 @@ const (
 	AttemptPending AttemptStatus = "pending"
 	AttemptLocked  AttemptStatus = "locked"
 	AttemptFailed  AttemptStatus = "failed"
+	AttemptAborted AttemptStatus = "aborted"
 )
 
 type Attempt struct {

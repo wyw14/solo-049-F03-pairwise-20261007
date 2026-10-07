@@ -42,6 +42,7 @@ type Runtime struct {
 	WindowRecompute  *passsvc.WindowRecomputer
 	Replanner        *passsvc.Replanner
 	Extensions       *passsvc.ExtensionService
+	Canceler         *passsvc.Canceler
 	Deadlines        *passsvc.DeadlineManager
 	Unlocker         *receiver.Unlocker
 	Finalizer        *passsvc.Finalizer
@@ -111,6 +112,7 @@ func NewRuntime(stateRoot string) (*Runtime, error) {
 		return nil, err
 	}
 	attempts.SetSink(passes)
+	canceler := passsvc.NewCanceler(passes, timeline, fleet, commands, attempts, recorderManager, trail)
 	recordingState := passsvc.NewRecordingState(passes, recorderManager)
 	handovers := handover.NewCoordinator(recordingState, recorderManager, trail)
 	stower := antenna.NewStowController(fleet, trail)
@@ -121,7 +123,7 @@ func NewRuntime(stateRoot string) (*Runtime, error) {
 		Reservations: scheduler.NewReservationPlanner(windows, timeline, 30*time.Second),
 		Antennas:     fleet, Executor: antenna.NewExecutor(fleet, commands, trail), Stower: stower,
 		RF: rfController, Recorder: recorderManager, Passes: passes, WindowRecompute: windowRecompute,
-		Replanner: replanner, Extensions: extensions, Deadlines: deadlines, Unlocker: unlocker,
+		Replanner: replanner, Extensions: extensions, Canceler: canceler, Deadlines: deadlines, Unlocker: unlocker,
 		Finalizer: finalizer, Attempts: attempts, RecordingState: recordingState,
 		Handovers: handovers, Weather: weatherCoordinator, receiverSessions: make(map[string]*receiver.Session),
 	}

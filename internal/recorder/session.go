@@ -120,6 +120,31 @@ func (m *Manager) StopForFailure(passID, attemptID, reason string) error {
 	return nil
 }
 
+// AbortForPass keeps every unfinished recording of one pass as aborted and
+// writes the cancel reason. Sealed segments are final and stay untouched.
+func (m *Manager) AbortForPass(passID, reason string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	aborted := 0
+	for _, current := range m.sessions {
+		if current.segment.PassID != passID || (current.segment.Status != Open && current.segment.Status != Draining) {
+			continue
+		}
+		current.segment.Status = Aborted
+		current.segment.SealReason = reason
+		current.segment.SealedAt = time.Now().UTC()
+		aborted++
+	}
+	if aborted == 0 {
+		return 0, nil
+	}
+	if err := m.flushLocked(); err != nil {
+		return 0, err
+	}
+	_, _ = m.audit.Record(audit.Event{Component: "recorder", Action: "aborted", Subject: passID, Fields: map[string]any{"count": aborted, "reason": reason}})
+	return aborted, nil
+}
+
 func (m *Manager) flushLocked() error {
 	values := make([]Segment, 0, len(m.sessions))
 	for _, current := range m.sessions {

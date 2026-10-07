@@ -80,6 +80,11 @@ func (d *AttemptDispatcher) Deliver(result AcquisitionResult) error {
 		d.mu.Unlock()
 		return nil
 	}
+	if attempt.Status != AttemptPending {
+		_, _ = d.audit.Record(audit.Event{Component: "receiver", Action: "result.late", Subject: result.AttemptID, Severity: audit.Warning, Fields: map[string]any{"status": string(attempt.Status), "error_code": result.ErrorCode}})
+		d.mu.Unlock()
+		return nil
+	}
 	if result.Locked && result.Synced {
 		attempt.Status = AttemptLocked
 		attempt.Epoch = result.Epoch
@@ -99,6 +104,33 @@ func (d *AttemptDispatcher) Deliver(result AcquisitionResult) error {
 		return fmt.Errorf("receiver result sink is not configured")
 	}
 	return sink.ApplyAcquisitionResult(result)
+}
+
+// AbortForPass terminates every pending attempt of one pass. Finished
+// attempts are historical records and stay untouched, so a repeated abort
+// cannot disturb attempts a later task may have started.
+func (d *AttemptDispatcher) AbortForPass(passID, reason string) (int, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	aborted := 0
+	for id, attempt := range d.attempts {
+		if attempt.PassID != passID || attempt.Status != AttemptPending {
+			continue
+		}
+		attempt.Status = AttemptAborted
+		attempt.ErrorCode = reason
+		attempt.FinishedAt = time.Now().UTC()
+		d.attempts[id] = attempt
+		aborted++
+	}
+	if aborted == 0 {
+		return 0, nil
+	}
+	if err := d.flushLocked(); err != nil {
+		return 0, err
+	}
+	_, _ = d.audit.Record(audit.Event{Component: "receiver", Action: "attempts.aborted", Subject: passID, Fields: map[string]any{"count": aborted, "reason": reason}})
+	return aborted, nil
 }
 
 func (d *AttemptDispatcher) Current(passID string) (Attempt, bool) {

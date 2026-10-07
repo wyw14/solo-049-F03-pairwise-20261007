@@ -12,8 +12,10 @@ import (
 	stationclock "orbitlink/internal/clock"
 	passsvc "orbitlink/internal/pass"
 	"orbitlink/internal/receiver"
+	"orbitlink/internal/recorder"
 	"orbitlink/internal/rf"
 	"orbitlink/internal/satellite"
+	"orbitlink/internal/scheduler"
 	"orbitlink/internal/weather"
 )
 
@@ -109,8 +111,143 @@ func TestEphemerisClockAndWindSafetyFlow(t *testing.T) {
 	}
 }
 
-func TestRouterRejectsOverlappingReservation(t *testing.T) {
+func TestCancelReleasesPassResources(t *testing.T) {
 	runtime := newTestRuntime(t)
+	router, err := NewRouter(runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(router)
+	defer server.Close()
+	value := runtime.Passes.List()[0]
+	attempt, err := runtime.Attempts.Begin(value.ID, "RF-01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Passes.BeginAcquisition(value.ID, attempt.ID); err != nil {
+		t.Fatal(err)
+	}
+	segment, err := runtime.Recorder.Start(value.ID, value.OwnerStation, value.OwnerGeneration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/api/passes/"+value.ID+"/cancel", `{"reason":"operator request"}`)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("cancel returned %d", response.StatusCode)
+	}
+	var canceled passsvc.Pass
+	decodeBody(t, response, &canceled)
+	if canceled.Phase != passsvc.Canceled || canceled.FailureReason != "operator request" {
+		t.Fatalf("unexpected pass after cancel: %#v", canceled)
+	}
+	released := false
+	for _, interval := range runtime.Timeline.List(value.AntennaID) {
+		if interval.ReservationID == value.ReservationID {
+			released = interval.Status == scheduler.Released
+		}
+	}
+	if !released {
+		t.Fatal("cancel did not release the antenna timeline reservation")
+	}
+	state, _ := runtime.Antennas.State(value.AntennaID)
+	if state.OwnerPassID != "" || state.OwnerGeneration != 0 {
+		t.Fatalf("cancel did not release antenna ownership: %#v", state)
+	}
+	commands := runtime.Commands.List(value.ID)
+	if len(commands) == 0 {
+		t.Fatal("expected seeded pointing commands")
+	}
+	for _, command := range commands {
+		if !command.Retired || command.RetireCause != "pass canceled: operator request" {
+			t.Fatalf("cancel did not retire pointing command: %#v", command)
+		}
+	}
+	if due := runtime.Commands.Due(time.Now().Add(time.Hour)); len(due) != 0 {
+		t.Fatalf("retired commands still due: %#v", due)
+	}
+	aborted, found := findAttempt(runtime, attempt.ID)
+	if !found || aborted.Status != receiver.AttemptAborted {
+		t.Fatalf("cancel did not abort the receive attempt: %#v", aborted)
+	}
+	recordings := runtime.Recorder.List()
+	var recording recorder.Segment
+	for _, item := range recordings {
+		if item.ID == segment.ID {
+			recording = item
+		}
+	}
+	if recording.Status != recorder.Aborted || recording.SealReason != "pass canceled: operator request" {
+		t.Fatalf("recording was not kept as aborted with reason: %#v", recording)
+	}
+	late := receiver.AcquisitionResult{PassID: value.ID, AttemptID: attempt.ID, ChainID: "RF-01", Locked: true, Synced: true, Epoch: 9}
+	if err := runtime.Attempts.Deliver(late); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := runtime.Passes.Get(value.ID)
+	if after.Phase != passsvc.Canceled {
+		t.Fatalf("late acquisition result revived a canceled pass: %#v", after)
+	}
+	if current, _ := findAttempt(runtime, attempt.ID); current.Status != receiver.AttemptAborted {
+		t.Fatalf("late result mutated an aborted attempt: %#v", current)
+	}
+}
+
+func TestRepeatedCancelDoesNotReleaseOtherPass(t *testing.T) {
+	runtime := newTestRuntime(t)
+	first := runtime.Passes.List()[0]
+	if _, err := runtime.Canceler.Cancel(first.ID, "operator request"); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	second, err := runtime.Passes.Create(passsvc.CreateRequest{SatelliteID: "SAT-C07", AntennaID: first.AntennaID, RFChains: []string{"RF-03"}, RequiredReceiverChains: []string{"RF-03"}, AOS: now.Add(20 * time.Minute), LOS: now.Add(28 * time.Minute), Revision: 1, OwnerStation: "north"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.WindowRecompute.Apply(second.ID, second.Window); err != nil {
+		t.Fatal(err)
+	}
+	reservation, err := runtime.Reservations.ReservePass(second.ID, second.AntennaID)
+	if err != nil {
+		t.Fatalf("canceled pass did not free the timeline: %v", err)
+	}
+	if err := runtime.Passes.SetReservation(second.ID, reservation.ReservationID, reservation.Generation); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.Antennas.Claim(reservation); err != nil {
+		t.Fatalf("canceled pass did not free antenna ownership: %v", err)
+	}
+	if err := runtime.Replanner.QueueInitial(second.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.Canceler.Cancel(first.ID, "operator request"); err != nil {
+		t.Fatal(err)
+	}
+	for _, interval := range runtime.Timeline.List(first.AntennaID) {
+		if interval.ReservationID == reservation.ReservationID && interval.Status == scheduler.Released {
+			t.Fatal("repeated cancel released the next pass's reservation")
+		}
+	}
+	state, _ := runtime.Antennas.State(first.AntennaID)
+	if state.OwnerPassID != second.ID {
+		t.Fatalf("repeated cancel released the next pass's ownership: %#v", state)
+	}
+	for _, command := range runtime.Commands.List(second.ID) {
+		if command.Retired {
+			t.Fatalf("repeated cancel retired the next pass's command: %#v", command)
+		}
+	}
+}
+
+func findAttempt(runtime *Runtime, id string) (receiver.Attempt, bool) {
+	for _, attempt := range runtime.Attempts.List() {
+		if attempt.ID == id {
+			return attempt, true
+		}
+	}
+	return receiver.Attempt{}, false
+}
+
+func TestRouterRejectsOverlappingReservation(t *testing.T) {	runtime := newTestRuntime(t)
 	first := runtime.Passes.List()[0]
 	second, err := runtime.Passes.Create(passsvc.CreateRequest{SatelliteID: "SAT-C07", AntennaID: first.AntennaID, RFChains: []string{"RF-03"}, RequiredReceiverChains: []string{"RF-03"}, AOS: first.Window.AOS.Add(time.Minute), LOS: first.Window.LOS.Add(time.Minute), Revision: 1, OwnerStation: "north"})
 	if err != nil {

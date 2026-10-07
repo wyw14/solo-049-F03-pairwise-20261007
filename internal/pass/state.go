@@ -179,8 +179,12 @@ func (s *Service) Cancel(passID, reason string) error {
 		if value.Phase == Completed || value.Phase == Sealed {
 			return fmt.Errorf("completed pass cannot be canceled")
 		}
+		if value.Phase == Canceled {
+			return nil
+		}
 		value.Phase = Canceled
 		value.FailureReason = reason
+		value.CurrentAttemptID = ""
 		return nil
 	})
 }
