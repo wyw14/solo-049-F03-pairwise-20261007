@@ -120,6 +120,37 @@ func (m *Manager) StopForFailure(passID, attemptID, reason string) error {
 	return nil
 }
 
+// AbortForPass keeps the segments a pass has already produced but marks them
+// aborted with the reason, instead of draining and sealing them.
+func (m *Manager) AbortForPass(passID, reason string) error {
+	m.mu.Lock()
+	var aborted []Segment
+	for _, current := range m.sessions {
+		if current.segment.PassID != passID {
+			continue
+		}
+		if current.segment.Status != Open && current.segment.Status != Draining {
+			continue
+		}
+		current.segment.Status = Aborted
+		current.segment.SealReason = reason
+		current.segment.SealedAt = time.Now().UTC()
+		aborted = append(aborted, current.segment)
+	}
+	var err error
+	if len(aborted) > 0 {
+		err = m.flushLocked()
+	}
+	m.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	for _, segment := range aborted {
+		_, _ = m.audit.Record(audit.Event{Component: "recorder", Action: "aborted", Subject: segment.ID, Fields: map[string]any{"pass_id": passID, "reason": reason}})
+	}
+	return nil
+}
+
 func (m *Manager) flushLocked() error {
 	values := make([]Segment, 0, len(m.sessions))
 	for _, current := range m.sessions {

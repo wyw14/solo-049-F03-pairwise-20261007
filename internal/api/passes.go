@@ -195,11 +195,11 @@ func (r *Runtime) cancelPass(writer http.ResponseWriter, request *http.Request) 
 		writeError(writer, err)
 		return
 	}
-	if err := r.Passes.Cancel(chi.URLParam(request, "passID"), input.Reason); err != nil {
+	value, err := r.Canceler.Cancel(chi.URLParam(request, "passID"), input.Reason)
+	if err != nil {
 		writeError(writer, err)
 		return
 	}
-	value, _ := r.Passes.Get(chi.URLParam(request, "passID"))
 	writeJSON(writer, http.StatusOK, value)
 }
 

@@ -12,8 +12,10 @@ import (
 	stationclock "orbitlink/internal/clock"
 	passsvc "orbitlink/internal/pass"
 	"orbitlink/internal/receiver"
+	"orbitlink/internal/recorder"
 	"orbitlink/internal/rf"
 	"orbitlink/internal/satellite"
+	"orbitlink/internal/scheduler"
 	"orbitlink/internal/weather"
 )
 
@@ -121,6 +123,112 @@ func TestRouterRejectsOverlappingReservation(t *testing.T) {
 	}
 	if _, err := runtime.Reservations.ReservePass(second.ID, second.AntennaID); err == nil {
 		t.Fatal("overlapping reservation unexpectedly succeeded")
+	}
+}
+
+func TestCancelReleasesPassResourcesIdempotently(t *testing.T) {
+	runtime := newTestRuntime(t)
+	value := runtime.Passes.List()[0]
+	attempt, err := runtime.Attempts.Begin(value.ID, "RF-01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Passes.BeginAcquisition(value.ID, attempt.ID); err != nil {
+		t.Fatal(err)
+	}
+	segment, err := runtime.Recorder.Start(value.ID, value.OwnerStation, value.OwnerGeneration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	follow, err := runtime.Passes.Create(passsvc.CreateRequest{SatelliteID: "SAT-C07", AntennaID: value.AntennaID, RFChains: []string{"RF-03"}, RequiredReceiverChains: []string{"RF-03"}, AOS: value.Window.LOS.Add(10 * time.Minute), LOS: value.Window.LOS.Add(18 * time.Minute), Revision: 1, OwnerStation: "north"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.WindowRecompute.Apply(follow.ID, follow.Window); err != nil {
+		t.Fatal(err)
+	}
+	followReservation, err := runtime.Reservations.ReservePass(follow.ID, follow.AntennaID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Passes.SetReservation(follow.ID, followReservation.ReservationID, followReservation.Generation); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Replanner.QueueInitial(follow.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	canceled, err := runtime.Canceler.Cancel(value.ID, "operator request")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canceled.Phase != passsvc.Canceled || canceled.FailureReason != "operator request" {
+		t.Fatalf("unexpected cancel state: %#v", canceled)
+	}
+	for _, interval := range runtime.Timeline.List(value.AntennaID) {
+		if interval.PassID == value.ID && interval.Status != scheduler.Released {
+			t.Fatalf("canceled pass reservation still %s", interval.Status)
+		}
+		if interval.PassID == follow.ID && interval.Status == scheduler.Released {
+			t.Fatal("cancel released the follow-up reservation")
+		}
+	}
+	state, _ := runtime.Antennas.State(value.AntennaID)
+	if state.OwnerPassID != "" {
+		t.Fatalf("antenna still owned by %s", state.OwnerPassID)
+	}
+	for _, command := range runtime.Commands.List(value.ID) {
+		if !command.Retired {
+			t.Fatal("pointing command of canceled pass left executable")
+		}
+	}
+	for _, command := range runtime.Commands.List(follow.ID) {
+		if command.Retired {
+			t.Fatal("cancel retired a follow-up pointing command")
+		}
+	}
+	if _, found := runtime.Attempts.Current(value.ID); found {
+		t.Fatal("canceled pass still has a current receive attempt")
+	}
+	for _, item := range runtime.Attempts.List() {
+		if item.ID == attempt.ID && item.Status != receiver.AttemptAborted {
+			t.Fatalf("receive attempt is %s, not aborted", item.Status)
+		}
+	}
+	for _, item := range runtime.Recorder.List() {
+		if item.ID == segment.ID {
+			if item.Status != recorder.Aborted {
+				t.Fatalf("recording is %s, not aborted", item.Status)
+			}
+			if !strings.Contains(item.SealReason, "operator request") {
+				t.Fatalf("abort reason %q does not name the cancel reason", item.SealReason)
+			}
+		}
+	}
+
+	if _, err := runtime.Antennas.Claim(followReservation); err != nil {
+		t.Fatal(err)
+	}
+	again, err := runtime.Canceler.Cancel(value.ID, "operator request")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Phase != passsvc.Canceled {
+		t.Fatalf("repeated cancel changed phase to %s", again.Phase)
+	}
+	state, _ = runtime.Antennas.State(value.AntennaID)
+	if state.OwnerPassID != follow.ID {
+		t.Fatalf("repeated cancel released antenna now owned by %s", state.OwnerPassID)
+	}
+	for _, interval := range runtime.Timeline.List(value.AntennaID) {
+		if interval.PassID == follow.ID && interval.Status == scheduler.Released {
+			t.Fatal("repeated cancel released the follow-up reservation")
+		}
+	}
+	for _, command := range runtime.Commands.List(follow.ID) {
+		if command.Retired {
+			t.Fatal("repeated cancel retired a follow-up pointing command")
+		}
 	}
 }
 

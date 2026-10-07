@@ -68,6 +68,33 @@ func (q *CommandQueue) Replace(passID string, revision int64, commands []Pointin
 	return store.WriteJSON(q.path, q.commands)
 }
 
+// RetireForPass retires every unexecuted command queued for a pass. It only
+// touches commands carrying that pass ID, so commands of other passes — even
+// ones queued later for the same antenna — are never affected.
+func (q *CommandQueue) RetireForPass(passID, cause string) (int, error) {
+	if passID == "" {
+		return 0, fmt.Errorf("pass is required")
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	retired := 0
+	for index := range q.commands {
+		if q.commands[index].PassID == passID && !q.commands[index].Retired {
+			q.commands[index].Retired = true
+			q.commands[index].RetireCause = cause
+			retired++
+		}
+	}
+	if retired == 0 {
+		return 0, nil
+	}
+	delete(q.active, passID)
+	if err := store.WriteJSON(q.path, q.commands); err != nil {
+		return 0, err
+	}
+	return retired, nil
+}
+
 func (q *CommandQueue) Due(now time.Time) []PointingCommand {
 	q.mu.RLock()
 	defer q.mu.RUnlock()

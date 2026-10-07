@@ -101,6 +101,39 @@ func (d *AttemptDispatcher) Deliver(result AcquisitionResult) error {
 	return sink.ApplyAcquisitionResult(result)
 }
 
+// AbortForPass abandons every pending acquisition attempt of a pass. Aborted
+// attempts stop being current, so a result arriving late is ignored as stale.
+func (d *AttemptDispatcher) AbortForPass(passID, reason string) (int, error) {
+	d.mu.Lock()
+	aborted := 0
+	now := time.Now().UTC()
+	for id, attempt := range d.attempts {
+		if attempt.PassID != passID || attempt.Status != AttemptPending {
+			continue
+		}
+		attempt.Status = AttemptAborted
+		attempt.ErrorCode = reason
+		attempt.FinishedAt = now
+		d.attempts[id] = attempt
+		if d.current[passID] == id {
+			delete(d.current, passID)
+		}
+		aborted++
+	}
+	var err error
+	if aborted > 0 {
+		err = d.flushLocked()
+	}
+	d.mu.Unlock()
+	if err != nil {
+		return 0, err
+	}
+	if aborted > 0 {
+		_, _ = d.audit.Record(audit.Event{Component: "receiver", Action: "attempt.aborted", Subject: passID, Fields: map[string]any{"count": aborted, "reason": reason}})
+	}
+	return aborted, nil
+}
+
 func (d *AttemptDispatcher) Current(passID string) (Attempt, bool) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
